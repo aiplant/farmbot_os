@@ -20,7 +20,7 @@ defmodule Farmbot.BotState.Transport.AMQP do
 
   defmodule State do
     @moduledoc false
-    defstruct [:conn, :chan, :queue_name, :bot, :state_cache]
+    defstruct [:conn, :chan, :queue_name, :bot, :state_cache, :camera, :camera_timer]
   end
 
   def init([]) do
@@ -34,9 +34,11 @@ defmodule Farmbot.BotState.Transport.AMQP do
          :ok         <- AMQP.Queue.bind(chan, queue_name, @exchange, [routing_key: "bot.#{device}.from_clients"]),
          :ok         <- AMQP.Queue.bind(chan, queue_name, @exchange, [routing_key: "bot.#{device}.sync.#"]),
          {:ok, _tag} <- Basic.consume(chan, queue_name),
-         state       <- struct(State, [conn: conn, chan: chan, queue_name: queue_name, bot: device])
+         {:ok, camera} <- Farmbot.System.Camera.start_link(self()),
+         state       <- struct(State, [conn: conn, chan: chan, queue_name: queue_name, bot: device, camera: camera])
     do
       # Logger.success(3, "Connected to real time services.")
+      Process.link(camera)
       {:consumer, state, subscribe_to: [Farmbot.BotState, Farmbot.Logger]}
     else
       {:error, {:auth_failure, msg}} = fail ->
@@ -45,6 +47,12 @@ defmodule Farmbot.BotState.Transport.AMQP do
       {:error, reason} ->
         Logger.error 1, "Got error authenticating with Real time services: #{inspect reason}"
         :ignore
+    end
+  end
+
+  def terminate(reason, state) do
+    if Process.alive?(state.camera) do
+      Farmbot.System.Camera.stop(state.camera, reason)
     end
   end
 
@@ -91,6 +99,14 @@ defmodule Farmbot.BotState.Transport.AMQP do
     {:noreply, [], state}
   end
 
+  def handle_info({:camera, {:frame, frame}}, state) do
+    # Logger.info 3, "got frame"
+    encoded_frame = Base.encode64(frame)
+    payload = %{frame: encoded_frame} |> Poison.encode!
+    :ok = AMQP.Basic.publish state.chan, @exchange, "bot.#{state.bot}.stream.camera", payload
+    {:noreply, [], state}
+  end
+
   # Confirmation sent by the broker after registering this process as a consumer
   def handle_info({:basic_consume_ok, _}, state) do
     {:noreply, [], state}
@@ -111,7 +127,7 @@ defmodule Farmbot.BotState.Transport.AMQP do
     route = String.split(key, ".")
     case route do
       ["bot", ^device, "from_clients"] ->
-        handle_celery_script(payload, state)
+        state = handle_celery_script(payload, state)
         {:noreply, [], state}
       ["bot", ^device, "sync", resource, _]
       when resource in ["Log", "User", "Image", "WebcamFeed"] ->
@@ -127,11 +143,34 @@ defmodule Farmbot.BotState.Transport.AMQP do
     end
   end
 
-  defp handle_celery_script(payload, _state) do
+  def handle_info(:cancel_camera, state) do
+    Farmbot.System.Camera.release(state.camera)
+    {:noreply, [], %{state | camera_timer: nil}}
+  end
+
+  defp handle_celery_script(payload, state) do
     case AST.decode(payload) do
-      {:ok, ast} -> spawn CeleryScript, :execute, [ast]
-      _ -> :ok
+      {:ok, ast} ->
+        unless Farmbot.System.Camera.claimed?(state.camera) do
+          Farmbot.System.Camera.claim(state.camera)
+        end
+        maybe_cancel_camera_timer(state.camera_timer)
+        camera_timer = start_camera_timer()
+        spawn CeleryScript, :execute, [ast]
+        %{state | camera_timer: camera_timer}
+      _ ->
+        state
     end
+  end
+
+  defp maybe_cancel_camera_timer(nil), do: :ok
+  defp maybe_cancel_camera_timer(timer) do
+    Process.cancel_timer(timer)
+    :ok
+  end
+
+  defp start_camera_timer do
+    Process.send_after(self(), :cancel_camera, 600000)
   end
 
   defp handle_sync_cmd(kind, id, payload, state) do

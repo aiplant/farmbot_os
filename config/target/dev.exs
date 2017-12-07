@@ -89,6 +89,9 @@ config :bootloader,
   init: [:nerves_runtime, :nerves_init_gadget],
   app: :farmbot
 
+config :nerves_network,
+  regulatory_domain: "US"
+
 if Mix.Project.config[:target] == "rpi3" do
   config :nerves, :firmware, fwup_conf: "fwup_interim.conf"
 end
